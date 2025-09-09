@@ -1,24 +1,17 @@
-FROM python:3.10-slim
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y python3-pip git && rm -rf /var/lib/apt/lists/*
 
-# deps system mínimas
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
- && rm -rf /var/lib/apt/lists/*
-
-# deps python
+# Instala requirements con versiones fijadas
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+
+# (Opcional pero recomendado) cache de modelos para build reproducible
+ENV HF_HOME=/models TRANSFORMERS_CACHE=/models HUGGINGFACE_HUB_CACHE=/models HF_HUB_ENABLE_HF_TRANSFER=1
 
 WORKDIR /app
-COPY . /app
+COPY app.py mapper.py /app
 
-# Variables que puedes ajustar en RunPod (Environment Variables)
-#   HF_SPACE_ID  = phenixrhyder/3D-Minecraft-Skin-Generator
-#   HF_TOKEN     = <tu token de HF para evitar rate limit>
-#   HF_SPACE_URL = (opcional) URL directa del Space si quieres
-ENV HF_SPACE_ID=phenixrhyder/3D-Minecraft-Skin-Generator
-
-CMD ["python", "-u", "handler.py"]
+EXPOSE 8000
+CMD ["uvicorn", "app:app", "--host","0.0.0.0","--port","8000"]

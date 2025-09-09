@@ -3,36 +3,27 @@ import os, io, base64, traceback, time, random
 from typing import Any, Dict, List
 from PIL import Image
 import runpod
-from gradio_client import Client  # ojo: sin handle_file
+from gradio_client import Client
+
+VERSION = "space-proxy v3"
 
 HF_SPACE_ID  = os.getenv("HF_SPACE_ID", "phenixrhyder/3D-Minecraft-Skin-Generator")
-HF_SPACE_URL = os.getenv("HF_SPACE_URL")  # opcional (URL completa del Space)
-HF_TOKEN     = os.getenv("HF_TOKEN")      # muy recomendable
+HF_SPACE_URL = os.getenv("HF_SPACE_URL")  # opcional: URL completa del Space
+HF_TOKEN     = os.getenv("HF_TOKEN")      # MUY recomendable para evitar rate limit
 
 _client: Client | None = None
 
-# Orden POSICIONAL conocida de ese Space:
+# Orden POSICIONAL del Space:
 # predict(prompt, stable_diffusion_model, num_inference_steps, guidance_scale,
 #         model_precision_type, seed, filename, model_3d, verbose)
-SPACE_PARAM_ORDER = [
-    "prompt",
-    "stable_diffusion_model",
-    "num_inference_steps",
-    "guidance_scale",
-    "model_precision_type",
-    "seed",
-    "filename",
-    "model_3d",
-    "verbose",
-]
-
 def _boot():
     global _client
-    print(f"[boot] connecting to space: {HF_SPACE_ID} (url={HF_SPACE_URL or '-'})")
+    print(f"[boot] {VERSION} — connecting to space: {HF_SPACE_ID} (url={HF_SPACE_URL or '-'})")
     _client = Client(HF_SPACE_URL or HF_SPACE_ID, hf_token=HF_TOKEN, verbose=False)
     try:
         info = _client.view_api(return_format="dict")
-        print(f"[boot] view_api ok (named_endpoints: {list((info or {}).get('named_endpoints', {}).keys())})")
+        names = list((info or {}).get("named_endpoints", {}).keys())
+        print(f"[boot] view_api ok, named_endpoints={names}")
     except Exception as e:
         print("[boot] view_api failed:", repr(e))
 
@@ -42,19 +33,13 @@ def _to_b64(img: Image.Image) -> str:
 
 def _open_any(x: Any) -> Image.Image | None:
     try:
-        if isinstance(x, Image.Image):
-            return x.convert("RGBA")
-        if isinstance(x, (bytes, bytearray)):
-            return Image.open(io.BytesIO(x)).convert("RGBA")
-        if isinstance(x, str):
-            return Image.open(x).convert("RGBA")
-        if isinstance(x, (list, tuple)) and x:
-            return _open_any(x[0])
+        if isinstance(x, Image.Image): return x.convert("RGBA")
+        if isinstance(x, (bytes, bytearray)): return Image.open(io.BytesIO(x)).convert("RGBA")
+        if isinstance(x, str): return Image.open(x).convert("RGBA")
+        if isinstance(x, (list, tuple)) and x: return _open_any(x[0])
         if isinstance(x, dict):
-            # algunos spaces devuelven {"path": "..."}
             p = x.get("path") or x.get("name")
-            if isinstance(p, str):
-                return Image.open(p).convert("RGBA")
+            if isinstance(p, str): return Image.open(p).convert("RGBA")
     except Exception:
         return None
     return None
@@ -64,13 +49,10 @@ def _flatten_images(result: Any) -> List[Image.Image]:
     def push(v):
         im = _open_any(v)
         if im: imgs.append(im)
-
     if isinstance(result, list):
         for v in result: push(v)
     else:
         push(result)
-
-    # fallback por si viene en tuplas/listas anidadas
     if not imgs and isinstance(result, (list, tuple)) and result:
         first = result[0]
         if isinstance(first, list):
@@ -79,42 +61,30 @@ def _flatten_images(result: Any) -> List[Image.Image]:
             push(first)
     return imgs
 
-def _build_positional_inputs(p: Dict[str, Any]) -> List[Any]:
-    """Construye la lista posicional en el orden exacto del Space."""
-    # defaults sensatos equivalentes a lo que has probado
+def _build_inputs(p: Dict[str, Any]) -> List[Any]:
     prompt = (p.get("prompt") or p.get("text") or p.get("input") or "").strip()
     if not prompt:
         raise ValueError("missing prompt")
 
-    stable_diffusion_model = p.get("stable_diffusion_model") or "xl"
-    steps = p.get("steps") or p.get("num_inference_steps") or 28
-    guidance_scale = p.get("guidance_scale") or p.get("cfg") or 6.5
-    model_precision_type = p.get("model_precision_type") or "fp16"
+    sd_model = p.get("stable_diffusion_model") or "xl"
+    steps = float(p.get("steps") or p.get("num_inference_steps") or 28)
+    cfg = float(p.get("guidance_scale") or p.get("cfg") or 6.5)
+    precision = p.get("model_precision_type") or "fp16"
 
     seed_raw = p.get("seed", None)
     if seed_raw in (None, "", "random", "rnd", "auto"):
-        seed = random.randint(1, 2**31 - 1)
+        seed = float(random.randint(1, 2**31 - 1))
     else:
         try:
             seed = float(seed_raw)
         except Exception:
-            seed = random.randint(1, 2**31 - 1)
+            seed = float(random.randint(1, 2**31 - 1))
 
     filename = p.get("filename") or "output-skin.png"
     model_3d = bool(p.get("model_3d", True))
     verbose = bool(p.get("verbose", False))
 
-    return [
-        prompt,
-        stable_diffusion_model,
-        float(steps),
-        float(guidance_scale),
-        model_precision_type,
-        float(seed),
-        filename,
-        model_3d,
-        verbose,
-    ]
+    return [prompt, sd_model, steps, cfg, precision, seed, filename, model_3d, verbose]
 
 def handler(event: Dict[str, Any]):
     global _client
@@ -124,10 +94,10 @@ def handler(event: Dict[str, Any]):
 
         p = (event.get("input") or {}) if isinstance(event, dict) else {}
         if p.get("warmup"):
-            return {"status": "WARM", "ok": True}
+            return {"status": "WARM", "ok": True, "version": VERSION}
 
-        inputs = _build_positional_inputs(p)
-        print(f"[run] api=/predict inputs={inputs[:5]} … (seed={inputs[5]}, steps={inputs[2]}, cfg={inputs[3]})")
+        inputs = _build_inputs(p)
+        print(f"[run] api=/predict inputs={inputs[:6]} … (3d={inputs[7]}, verbose={inputs[8]})")
 
         t0 = time.time()
         result = _client.predict(*inputs, api_name="/predict")
@@ -157,6 +127,6 @@ def handler(event: Dict[str, Any]):
     except Exception as e:
         print("[handler] FAILED:", repr(e))
         traceback.print_exc()
-        return {"status": "FAILED", "error": str(e)}
+        return {"status": "FAILED", "error": str(e), "version": VERSION}
 
 runpod.serverless.start({"handler": handler})

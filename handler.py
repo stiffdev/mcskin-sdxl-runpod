@@ -1,156 +1,138 @@
-import os, io, base64, random, traceback
-from typing import List, Optional
+# handler.py
+import os, io, base64, traceback, time
 from PIL import Image
-import torch, runpod
+import runpod
+from gradio_client import Client, handle_file
+from typing import Any, Dict, List
 
-from diffusers import (
-    StableDiffusionXLPipeline, StableDiffusionPipeline,
-    EulerAncestralDiscreteScheduler
-)
+HF_SPACE_ID = os.getenv("HF_SPACE_ID", "phenixrhyder/3D-Minecraft-Skin-Generator")
+HF_TOKEN    = os.getenv("HF_TOKEN")  # opcional, pero MUY recomendable para evitar rate limit
+SPACE_URL   = os.getenv("HF_SPACE_URL")  # opcional, p.ej. https://phenixrhyder-3d-minecraft-skin-generator.hf.space/
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE  = torch.float16 if DEVICE == "cuda" else torch.float32
+client: Client | None = None
+api_name: str | None = None
 
-# Puedes apuntar a rutas locales (si algún día horneas modelos) o al Hub
-BASE_MODEL_PATH_SDXL = os.getenv("BASE_MODEL_PATH_SDXL", "/models/sdxl")
-BASE_MODEL_PATH_SD2  = os.getenv("BASE_MODEL_PATH_SD2",  "/models/sd2")
-MODEL_ID_SDXL        = os.getenv("MODEL_ID_SDXL", "monadical-labs/minecraft-skin-generator-sdxl")
-MODEL_ID_SD2         = os.getenv("MODEL_ID_SD2",  "monadical-labs/minecraft-skin-generator")
-HF_TOKEN             = os.getenv("HF_TOKEN", None)
+def _boot():
+    global client, api_name
+    print(f"[boot] connecting to space: {HF_SPACE_ID}")
+    # Con token si lo tienes
+    client = Client(SPACE_URL or HF_SPACE_ID, hf_token=HF_TOKEN, verbose=False)
 
-def to_b64(img: Image.Image) -> str:
-    buf = io.BytesIO(); img.save(buf, format="PNG")
+    # Descubre endpoints disponibles
+    try:
+        info = client.view_api(return_format="dict")  # {'named_endpoints': {'/predict': {...}, ...}}
+        named = info.get("named_endpoints") or {}
+        # Heurística: elige el primero que produzca imagen o listado con imagen
+        # Si no sabemos, probamos /predict
+        candidates = list(named.keys()) or ["/predict"]
+        api_name = None
+        for k in candidates:
+            api_name = k
+            break
+        print(f"[boot] selected api_name={api_name}")
+    except Exception as e:
+        print("[boot] view_api failed:", repr(e))
+        api_name = "/predict"  # fallback
+
+def _to_b64(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
-def quantize(img: Image.Image, colors: int) -> Image.Image:
-    if not colors or colors <= 0: return img
-    return img.convert("RGB").convert(
-        "P", palette=Image.ADAPTIVE, colors=int(colors), dither=Image.Dither.NONE
-    ).convert("RGBA")
+def _result_to_images(result: Any) -> List[Image.Image]:
+    """
+    Convierte lo que devuelve el Space en lista de PIL Images.
+    Gradio puede devolver:
+      - PIL.Image
+      - ruta de archivo (str)
+      - bytes
+      - lista de lo anterior
+    """
+    def load_one(x) -> Image.Image | None:
+        if isinstance(x, Image.Image):
+            return x
+        if isinstance(x, (bytes, bytearray)):
+            try:
+                return Image.open(io.BytesIO(x)).convert("RGBA")
+            except Exception:
+                return None
+        if isinstance(x, str):
+            # path temp del Space
+            try:
+                return Image.open(x).convert("RGBA")
+            except Exception:
+                return None
+        return None
 
-def downscale_to_skin(img: Image.Image) -> Image.Image:
-    return img.convert("RGBA").resize((64, 64), resample=Image.NEAREST)
-
-def sanitize_txt(s: Optional[str]) -> Optional[str]:
-    if s is None: return None
-    s = s.strip()
-    return s if s else None
-
-pipe_sdxl = None
-pipe_sd2  = None
-
-def _set_scheduler(pipe):
-    try:
-        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
-        print("[boot] scheduler: Euler A")
-    except Exception as e:
-        print("[boot] scheduler keep default:", repr(e))
-    try:
-        pipe.enable_xformers_memory_efficient_attention()
-    except Exception:
-        pass
-    return pipe.to(DEVICE)
-
-def load_sdxl():
-    """Carga SDXL desde carpeta local si existe; si no, desde Hugging Face Hub."""
-    global pipe_sdxl
-    if pipe_sdxl is not None: return pipe_sdxl
-
-    if os.path.isdir(BASE_MODEL_PATH_SDXL):
-        print("[boot] loading SDXL (local):", BASE_MODEL_PATH_SDXL)
-        pipe = StableDiffusionXLPipeline.from_pretrained(
-            BASE_MODEL_PATH_SDXL, torch_dtype=DTYPE, local_files_only=True
-        )
+    imgs: List[Image.Image] = []
+    if isinstance(result, list):
+        for v in result:
+            im = load_one(v)
+            if im: imgs.append(im)
     else:
-        print("[boot] loading SDXL (hub):", MODEL_ID_SDXL)
-        pipe = StableDiffusionXLPipeline.from_pretrained(
-            MODEL_ID_SDXL, torch_dtype=DTYPE, use_safetensors=True, token=HF_TOKEN
-        )
-    pipe_sdxl = _set_scheduler(pipe)
-    return pipe_sdxl
+        im = load_one(result)
+        if im: imgs.append(im)
 
-def load_sd2():
-    """Carga SD2 desde carpeta local si existe; si no, desde Hugging Face Hub."""
-    global pipe_sd2
-    if pipe_sd2 is not None: return pipe_sd2
-
-    if os.path.isdir(BASE_MODEL_PATH_SD2):
-        print("[boot] loading SD2 (local):", BASE_MODEL_PATH_SD2)
-        pipe = StableDiffusionPipeline.from_pretrained(
-            BASE_MODEL_PATH_SD2, torch_dtype=DTYPE, safety_checker=None, local_files_only=True
-        )
-    else:
-        print("[boot] loading SD2 (hub):", MODEL_ID_SD2)
-        pipe = StableDiffusionPipeline.from_pretrained(
-            MODEL_ID_SD2, torch_dtype=DTYPE, use_safetensors=True, token=HF_TOKEN, safety_checker=None
-        )
-    pipe_sd2 = _set_scheduler(pipe)
-    return pipe_sd2
-
-ATLAS_SUFFIX = ", minecraft texture atlas 64x64, pixel art, flat lighting, transparent background, no logo, no watermark"
-NEGATIVE_DEFAULT = "photo, background, text, logo, watermark, gradient, blur, noisy, low quality, artifacts"
-
-def generate(
-    pipe, prompt: str,
-    steps: int = 28, cfg: float = 6.5,
-    negative_prompt: Optional[str] = None,
-    num_images: int = 1,
-    seed: Optional[int] = None,
-    quantize_colors: int = 28
-) -> List[Image.Image]:
-    prompt = prompt.strip() + ATLAS_SUFFIX
-    negative_prompt = sanitize_txt(negative_prompt) or NEGATIVE_DEFAULT
-    if seed in (None, "", "random", "auto"):
-        seed = random.randint(1, 2**31-1)
-    g = torch.Generator(device=DEVICE).manual_seed(int(seed))
-    out = pipe(
-        prompt=[prompt]*int(num_images),
-        negative_prompt=[negative_prompt]*int(num_images),
-        num_inference_steps=int(steps),
-        guidance_scale=float(cfg),
-        generator=g
-    ).images
-    imgs = []
-    for im in out:
-        im = downscale_to_skin(im)
-        if quantize_colors: im = quantize(im, quantize_colors)
-        imgs.append(im)
     return imgs
 
-def handler(event):
+def handler(event: Dict[str, Any]):
+    global client, api_name
     try:
-        p = (event.get("input") or {})
-        if p.get("warmup"):
-            return {"ok": True, "status": "WARM"}
+        if client is None:
+            _boot()
 
-        model = (p.get("model") or "sdxl").strip().lower()
-        pipe = load_sd2() if model == "sd2" else load_sdxl()
+        p = (event.get("input") or {}) if isinstance(event, dict) else {}
+        if p.get("warmup"):  # healthcheck
+            return {"status": "WARM", "ok": True}
 
-        prompt  = sanitize_txt(p.get("prompt")) or "minecraft character, pixel art"
-        steps   = max(16, min(int(p.get("steps", 28)), 40))
-        cfg     = max(3.0, min(float(p.get("cfg", 6.5)), 12.0))
-        n       = max(1, min(int(p.get("num_images", 1)), 4))
-        seedraw = p.get("seed", None)
-        seed    = None if seedraw in (None, "", "random", "auto") else int(seedraw)
-        neg     = p.get("negative_prompt", None)
-        qcols   = int(p.get("quantize_colors", 28))
+        # Payload básico esperado desde tu app/Worker
+        prompt         = (p.get("prompt") or p.get("text") or p.get("input") or "").strip()
+        negative       = (p.get("negative_prompt") or "").strip() or None
+        seed           = p.get("seed", None)
+        steps          = p.get("steps", None)
+        num_images     = p.get("num_images", None)
+        guidance_scale = p.get("guidance_scale", p.get("cfg", None))
 
-        print(f"[run] model={model} steps={steps} cfg={cfg} n={n} seed={seed} prompt={prompt!r}")
+        # Preparamos kwargs: solo pasamos lo que exista y no sea None.
+        # Distintos Spaces cambian el nombre de parámetros; por eso probamos
+        # varias claves comúnmente usadas.
+        # Gradio ignora kwargs desconocidos.
+        candidate_kwargs = {
+            "prompt": prompt,
+            "negative_prompt": negative,
+            "seed": seed,
+            "steps": steps or p.get("num_inference_steps"),
+            "num_images": num_images,
+            "guidance_scale": guidance_scale,
+        }
+        # filtra None
+        gr_kwargs = {k: v for k, v in candidate_kwargs.items() if v not in (None, "", [])}
 
-        imgs = generate(pipe, prompt, steps=steps, cfg=cfg,
-                        negative_prompt=neg, num_images=n,
-                        seed=seed, quantize_colors=qcols)
+        print(f"[run] api={api_name} kwargs={gr_kwargs}")
 
-        images_b64 = [to_b64(im) for im in imgs]
-        meta = {"model": model, "steps": steps, "cfg": cfg, "seed": seed, "count": len(images_b64)}
+        # Llamada a la API del Space
+        t0 = time.time()
+        result = client.predict(api_name=api_name, **gr_kwargs)
+        dt = time.time() - t0
+        print(f"[run] space call done in {dt:.2f}s")
 
+        imgs = _result_to_images(result)
+        if not imgs:
+            # A veces el Space devuelve (data, extras)
+            if isinstance(result, (list, tuple)) and result:
+                imgs = _result_to_images(result[0])
+
+        if not imgs:
+            return {"status": "FAILED", "error": "Space returned no images"}
+
+        images_b64 = [_to_b64(im) for im in imgs]
         return {
             "status": "COMPLETED",
-            "prompt": prompt,
             "images": images_b64,
-            "meta": meta,
-            "output": {"images": images_b64, "meta": meta}
+            "output": {"images": images_b64, "prompt": prompt},
+            "meta": {"elapsed_sec": dt, "count": len(images_b64)}
         }
+
     except Exception as e:
         print("[handler] FAILED:", repr(e))
         traceback.print_exc()

@@ -1,26 +1,24 @@
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+FROM python:3.10-slim
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    HF_HOME=/models-cache \
-    HUGGINGFACE_HUB_CACHE=/models-cache \
-    TRANSFORMERS_CACHE=/models-cache
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-RUN apt-get update && apt-get install -y python3-pip git && rm -rf /var/lib/apt/lists/*
+# deps system mínimas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+ && rm -rf /var/lib/apt/lists/*
 
-# Instala PyTorch con soporte CUDA 12.1
-RUN pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121
-
-# Reqs (no pongas "torch" en requirements.txt)
+# deps python
 COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
-
-# Config por defecto (sobreescribes en RunPod → Environment Variables)
-ENV MODEL_ID_SDXL=monadical-labs/minecraft-skin-generator-sdxl \
-    MODEL_ID_SD2=monadical-labs/minecraft-skin-generator
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 WORKDIR /app
 COPY . /app
 
-CMD ["python3", "-u", "handler.py"]
+# Variables que puedes ajustar en RunPod (Environment Variables)
+#   HF_SPACE_ID  = phenixrhyder/3D-Minecraft-Skin-Generator
+#   HF_TOKEN     = <tu token de HF para evitar rate limit>
+#   HF_SPACE_URL = (opcional) URL directa del Space si quieres
+ENV HF_SPACE_ID=phenixrhyder/3D-Minecraft-Skin-Generator
+
+CMD ["python", "-u", "handler.py"]

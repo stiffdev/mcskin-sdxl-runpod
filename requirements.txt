@@ -1,10 +1,8 @@
 runpod
-torch==2.3.1+cu121 ; platform_system != "Darwin" --find-links https://download.pytorch.org/whl/cu121
-torch==2.3.1 ; platform_system == "Darwin"
-diffusers==0.29.2
-transformers==4.43.3
-accelerate==0.33.0
-safetensors==0.4.3
-pillow==10.4.0
-huggingface_hub==0.24.6
-xformers==0.0.27.post2 ; platform_system != "Darwin"
+diffusers==0.27.2
+transformers==4.41.1
+accelerate==1.2.1
+safetensors
+pillow==10.3.0
+huggingface_hub==0.23.0
+peft==0.13.2

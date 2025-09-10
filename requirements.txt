@@ -1,13 +1,10 @@
-# xformers compatible con torch 2.3.1 + cu121
 xformers==0.0.26.post1
-
 diffusers==0.27.2
 transformers==4.41.2
 accelerate==0.30.1
 safetensors==0.4.3
+huggingface_hub==0.24.6
 numpy==1.26.4
 scipy==1.12.0
 Pillow==10.3.0
-
-# SDK para que RunPod invoque tu handler
 runpod==1.6.2

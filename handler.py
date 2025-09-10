@@ -1,46 +1,52 @@
-# handler.py — RunPod Serverless: robusto, sin .config, con fallback a SDXL base y LoRA opcional
-import os, io, base64, time, traceback
+# handler.py — RunPod Serverless con caché en volumen, logs de espacio y carga perezosa
+import os, io, base64, time, traceback, tempfile, shutil
 import torch
 import runpod
 from PIL import Image
 
+# ---------- RUTAS DE CACHÉ Y TMP EN EL VOLUMEN ----------
+# Si en RunPod montaste un volumen en /runpod-volume, lo usamos para TODO:
+VOLUME_ROOT = os.getenv("VOLUME_ROOT", "/runpod-volume")  # cambia si montaste otro path
+HF_CACHE_DIR = os.path.join(VOLUME_ROOT, "hf-cache")
+TMP_DIR      = os.path.join(VOLUME_ROOT, "tmp")
+
+# Exporta variables de entorno ANTES de cargar nada de diffusers/transformers
+os.makedirs(HF_CACHE_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
+
+os.environ.setdefault("HF_HOME", HF_CACHE_DIR)
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", HF_CACHE_DIR)
+os.environ.setdefault("TRANSFORMERS_CACHE", HF_CACHE_DIR)
+os.environ.setdefault("DIFFUSERS_CACHE", HF_CACHE_DIR)
+os.environ.setdefault("TORCH_HOME", HF_CACHE_DIR)
+
+# IMPORTANTÍSIMO: manda todos los temporales a tu volumen (no /tmp del root)
+os.environ.setdefault("TMPDIR", TMP_DIR)
+os.environ.setdefault("TEMP", TMP_DIR)
+os.environ.setdefault("TMP", TMP_DIR)
+
+# Opcionales recomendados
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+# Si no tienes hf_transfer instalado, mejor desactivar explicitamente:
+if os.getenv("HF_HUB_ENABLE_HF_TRANSFER") == "1":
+    # Si no está instalado, apágalo para evitar error de descarga
+    try:
+        import hf_transfer  # noqa: F401
+    except Exception:
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
+# ---------- IMPORTS QUE USAN LAS VARS DE ENTORNO ----------
 from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
 try:
     from diffusers import AutoencoderKL
 except Exception:
     AutoencoderKL = None
 
-# ----------------------------
-# Parcheo hf_transfer (opcional)
-# ----------------------------
-if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
-    try:
-        import hf_transfer  # noqa: F401
-        print("[BOOT] hf_transfer presente (fast download ON)", flush=True)
-    except Exception:
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-        print("[BOOT] HF_HUB_ENABLE_HF_TRANSFER=1 pero 'hf_transfer' no está instalado -> lo desactivo", flush=True)
-
-HF_CACHE = os.getenv("HUGGINGFACE_HUB_CACHE")
-if HF_CACHE:
-    try:
-        os.makedirs(HF_CACHE, exist_ok=True)
-        print(f"[BOOT] HUGGINGFACE_HUB_CACHE={HF_CACHE}", flush=True)
-    except Exception as _e:
-        print(f"[WARN] No pude crear cache dir {HF_CACHE}: {_e}", flush=True)
-
-torch.set_grad_enabled(False)
-
-# ----------------
-# ENV y constantes
-# ----------------
-MODEL_ID         = os.getenv("MODEL_ID", "monadical-labs/minecraft-skin-generator-sdxl")
-MODEL_REVISION   = os.getenv("MODEL_REVISION")
-BASE_SDXL_ID     = os.getenv("BASE_SDXL_ID", "stabilityai/stable-diffusion-xl-base-1.0")
-HF_TOKEN         = os.getenv("HF_TOKEN")
-VAE_ID           = os.getenv("VAE_ID")  # opcional
-LORA_WEIGHT_NAME = os.getenv("LORA_WEIGHT_NAME", "pytorch_lora_weights.safetensors")  # habitual en LoRA
-TRY_LORA         = os.getenv("TRY_LORA", "1") == "1"  # intenta aplicar LoRA del repo MODEL_ID
+# -------- Config ----------
+MODEL_ID       = os.getenv("MODEL_ID", "monadical-labs/minecraft-skin-generator-sdxl")
+MODEL_REVISION = os.getenv("MODEL_REVISION")  # opcional
+VAE_ID         = os.getenv("VAE_ID")          # opcional, ej: "stabilityai/sdxl-vae-fp16-fix"
+HF_TOKEN       = os.getenv("HF_TOKEN")        # opcional si repo privado
 
 HEIGHT   = int(os.getenv("GEN_HEIGHT", "768"))
 WIDTH    = int(os.getenv("GEN_WIDTH",  "768"))
@@ -50,67 +56,55 @@ STEPS    = int(os.getenv("STEPS",     "30"))
 DTYPE  = torch.float16
 DEVICE = "cuda"
 
+# Determinismo (evita kernels raros que hagan más tmp)
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
-print(
-    f"[BOOT] torch={torch.__version__} cuda={torch.cuda.is_available()} "
-    f"gpu={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}",
-    flush=True
-)
+def _print_space():
+    def _human(n):
+        for u in ["B","KB","MB","GB","TB"]:
+            if n < 1024: return f"{n:.1f}{u}"
+            n/=1024
+        return f"{n:.1f}PB"
+    try:
+        def _df(path):
+            st = os.statvfs(path)
+            total = st.f_frsize * st.f_blocks
+            free  = st.f_frsize * st.f_bavail
+            return _human(total), _human(free)
+        total_root, free_root = _df("/")
+        total_vol,  free_vol  = _df(VOLUME_ROOT)
+        print(f"[DISK] / total={total_root} free={free_root} | {VOLUME_ROOT} total={total_vol} free={free_vol}", flush=True)
+    except Exception as e:
+        print(f"[DISK] error leyendo espacio: {e}", flush=True)
+
+print(f"[BOOT] torch={torch.__version__} cuda={torch.cuda.is_available()} "
+      f"dev={DEVICE} name={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}", flush=True)
+_print_space()
+print(f"[PATHS] HF_CACHE_DIR={HF_CACHE_DIR} TMP_DIR={TMP_DIR}", flush=True)
 
 PIPE = None
 
-
-# --------------------
-# Scheduler “blindado”
-# --------------------
-def _attach_scheduler(pipe):
-    """
-    Nunca usamos .config de ningún sitio (evita 'NoneType.config').
-    Creamos un DPMSolverMultistepScheduler con parámetros típicos SDXL.
-    """
-    pipe.scheduler = DPMSolverMultistepScheduler(
-        num_train_timesteps=1000,
-        beta_start=0.00085,
-        beta_end=0.012,
-        beta_schedule="scaled_linear",
-        algorithm_type="dpmsolver++",
-        use_karras=True,
-        steps_offset=1
-    )
-    print("[SCHED] DPMSolverMultistepScheduler (fallback SDXL) adjuntado", flush=True)
-
-
-# -----------------------
-# Carga robusta del modelo
-# -----------------------
 def _load_pipe():
-    """
-    Estrategia:
-    1) Intentar cargar MODEL_ID como pipeline SDXL completa.
-    2) Si falla, cargar SDXL base.
-       2a) Si TRY_LORA=1, intentar aplicar LoRA desde MODEL_ID (LORA_WEIGHT_NAME).
-    3) En cualquier caso, adjuntar nuestro scheduler “blindado”.
-    """
     global PIPE
     if PIPE is not None:
         return PIPE
-
     t0 = time.time()
-    print(f"[LOAD] Intentando pipeline directa: {MODEL_ID} (rev={MODEL_REVISION})", flush=True)
+    print(f"[LOAD] Loading model: {MODEL_ID} (rev={MODEL_REVISION}) VAE={VAE_ID}", flush=True)
 
     vae = None
     if VAE_ID and AutoencoderKL is not None:
         try:
-            vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=DTYPE, token=HF_TOKEN)
-            print("[LOAD] VAE externo cargado", flush=True)
+            vae = AutoencoderKL.from_pretrained(
+                VAE_ID,
+                torch_dtype=DTYPE,
+                cache_dir=HF_CACHE_DIR,
+                token=HF_TOKEN
+            )
+            print("[LOAD] VAE loaded", flush=True)
         except Exception as e:
-            print(f"[WARN] Fallo cargando VAE '{VAE_ID}': {e}", flush=True)
+            print(f"[WARN] VAE load failed: {e}", flush=True)
 
-    pipe = None
-
-    # 1) Intento carga directa del repo (pipeline completa)
     try:
         pipe = StableDiffusionXLPipeline.from_pretrained(
             MODEL_ID,
@@ -119,75 +113,67 @@ def _load_pipe():
             vae=vae,
             use_safetensors=True,
             add_watermarker=None,
-            token=HF_TOKEN
+            token=HF_TOKEN,
+            cache_dir=HF_CACHE_DIR,          # <-- forzamos descarga al volumen
+            local_files_only=False
         )
-        print("[LOAD] Pipeline cargada directamente desde MODEL_ID", flush=True)
-    except Exception as e1:
-        print(f"[LOAD] No es pipeline completa o falló carga directa: {e1}", flush=True)
 
-    # 2) Fallback a SDXL base
-    if pipe is None:
+        # Scheduler defensivo (evita el 'NoneType has no attribute config')
         try:
-            print(f"[LOAD] Cargando SDXL base: {BASE_SDXL_ID}", flush=True)
-            pipe = StableDiffusionXLPipeline.from_pretrained(
-                BASE_SDXL_ID,
-                torch_dtype=DTYPE,
-                vae=vae,
-                use_safetensors=True,
-                add_watermarker=None,
-                token=HF_TOKEN
-            )
-            print("[LOAD] SDXL base cargada", flush=True)
+            if getattr(pipe, "scheduler", None) is None:
+                print("[LOAD] scheduler is None; creating DPMSolver...", flush=True)
+                pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                    {"num_train_timesteps": 1000, "solver_order": 2, "prediction_type": "epsilon"},
+                    use_karras=True
+                )
+            else:
+                pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                    pipe.scheduler.config, use_karras=True
+                )
+        except Exception as se:
+            print(f"[WARN] could not set DPMSolver: {se}; using default", flush=True)
 
-            # 2a) Intentar aplicar LoRA desde tu repo
-            if TRY_LORA:
+        # Desactiva watermark/safety
+        for attr in ("watermark", "watermarker", "safety_checker"):
+            if hasattr(pipe, attr):
                 try:
-                    pipe.load_lora_weights(
-                        pretrained_model_name_or_path=MODEL_ID,
-                        weight_name=LORA_WEIGHT_NAME,
-                        token=HF_TOKEN
-                    )
-                    pipe.fuse_lora()  # opcional (reduce overhead)
-                    print(f"[LOAD] LoRA '{MODEL_ID}/{LORA_WEIGHT_NAME}' aplicada y fusionada", flush=True)
-                except Exception as e_lora:
-                    print(f"[WARN] No pude aplicar LoRA desde {MODEL_ID}: {e_lora}", flush=True)
-        except Exception:
-            print("[ERROR] Falla cargando SDXL base:\n" + traceback.format_exc(), flush=True)
-            raise
+                    setattr(pipe, attr, None)
+                except Exception:
+                    pass
 
-    # Silenciar cosas innecesarias y enviar a GPU
-    if hasattr(pipe, "watermark"):   pipe.watermark = None
-    if hasattr(pipe, "watermarker"): pipe.watermarker = None
-    if hasattr(pipe, "safety_checker"):
+        pipe.to(DEVICE)
         try:
-            pipe.safety_checker = None
+            pipe.enable_xformers_memory_efficient_attention()
+        except Exception as e:
+            print(f"[WARN] xformers not enabled: {e}", flush=True)
+
+        pipe.enable_vae_slicing()
+
+        PIPE = pipe
+        print(f"[LOAD] Model ready in {time.time()-t0:.1f}s", flush=True)
+        _print_space()
+        return PIPE
+    except Exception as e:
+        print("[ERROR] Pipeline load failed:\n" + traceback.format_exc(), flush=True)
+        # Si se quedó basura parcial, intenta limpiar cache incompleta (sólo si hay poco espacio)
+        try:
+            _print_space()
+            # Limpieza selectiva de tmp si hace falta
+            if os.path.isdir(TMP_DIR):
+                for name in os.listdir(TMP_DIR):
+                    p = os.path.join(TMP_DIR, name)
+                    try:
+                        if os.path.isfile(p) or os.path.islink(p):
+                            os.unlink(p)
+                        else:
+                            shutil.rmtree(p, ignore_errors=True)
+                    except Exception:
+                        pass
+            _print_space()
         except Exception:
             pass
+        raise
 
-    # Adjuntar siempre nuestro scheduler “blindado”
-    _attach_scheduler(pipe)
-
-    pipe.set_progress_bar_config(disable=True)
-    pipe.to(DEVICE)
-
-    # xformers opcional
-    try:
-        pipe.enable_xformers_memory_efficient_attention()
-    except Exception as e:
-        print(f"[WARN] xformers no habilitado: {e}", flush=True)
-
-    # Pequeños tweaks memoria
-    try: pipe.enable_vae_slicing()
-    except: pass
-
-    print(f"[LOAD] Modelo listo en {time.time() - t0:.1f}s", flush=True)
-    PIPE = pipe
-    return PIPE
-
-
-# ------------------------
-# Utilidades de imagen PNG
-# ------------------------
 def _to_skin_64_png(hi: Image.Image) -> bytes:
     if hi.width != hi.height:
         s = min(hi.width, hi.height)
@@ -195,11 +181,11 @@ def _to_skin_64_png(hi: Image.Image) -> bytes:
     if hi.mode != "RGBA":
         hi = hi.convert("RGBA")
 
+    # Reescalado respetando "pixel-art"
     scale = max(1, hi.width // 64)
     if scale >= 2:
         lo = Image.new("RGBA", (64, 64))
-        src = hi.load()
-        dst = lo.load()
+        src = hi.load(); dst = lo.load()
         for y in range(64):
             sy = min(int((y + 0.5) * scale), hi.height - 1)
             for x in range(64):
@@ -213,14 +199,9 @@ def _to_skin_64_png(hi: Image.Image) -> bytes:
     return buf.getvalue()
 
 def _img_to_png(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    buf = io.BytesIO(); img.save(buf, format="PNG"); return buf.getvalue()
 
-
-# -------------
-# RunPod handler
-# -------------
+# ------------- RunPod handler -------------
 def handler(event):
     """
     input:
@@ -232,6 +213,9 @@ def handler(event):
       width/height (opc; por defecto ENV)
       return_64x64 (bool, opc; default True)
     """
+    # Asegura que tempfile también use TMP_DIR dentro del volumen
+    tempfile.tempdir = TMP_DIR
+
     try:
         inp = event.get("input", {}) or {}
         prompt   = inp.get("prompt", "minecraft skin")
@@ -243,8 +227,8 @@ def handler(event):
         r64      = bool(inp.get("return_64x64", True))
         seed     = inp.get("seed")
 
-        print(f"[RUN] prompt='{prompt[:120]}' steps={steps} guidance={guidance} "
-              f"size={width}x{height} seed={seed}", flush=True)
+        print(f"[RUN] prompt='{prompt[:120]}' steps={steps} guidance={guidance} size={width}x{height} seed={seed}", flush=True)
+        _print_space()
 
         pipe = _load_pipe()
 
@@ -252,47 +236,47 @@ def handler(event):
         if seed is not None:
             gen = gen.manual_seed(int(seed))
 
-        with torch.inference_mode():
-            out = pipe(
-                prompt=prompt,
-                negative_prompt=neg,
-                width=width, height=height,
-                guidance_scale=guidance,
-                num_inference_steps=steps,
-                generator=gen
-            )
-            img = out.images[0]
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=neg,
+            width=width, height=height,
+            guidance_scale=guidance,
+            num_inference_steps=steps,
+            generator=gen
+        )
+        img = out.images[0]
 
         png_bytes = _to_skin_64_png(img) if r64 else _img_to_png(img)
         b64 = base64.b64encode(png_bytes).decode("utf-8")
-        return {
+        result = {
             "ok": True,
             "w": 64 if r64 else img.width,
             "h": 64 if r64 else img.height,
             "image_b64": b64
         }
+        print("[RUN] done", flush=True)
+        return result
 
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
-            msg = ("CUDA OOM: baja GEN_WIDTH/GEN_HEIGHT a 640 o 512, steps≈25, "
-                   "y pon Concurrency=1 en el endpoint.")
+            msg = "CUDA OOM: baja GEN_WIDTH/GEN_HEIGHT a 640 o 512, steps a 25, y pon Concurrency=1"
             print(f"[OOM] {msg}", flush=True)
             return {"ok": False, "error": msg}
         print("[ERROR] RuntimeError:\n" + traceback.format_exc(), flush=True)
+        return {"ok": False, "error": str(e)}
+    except OSError as e:
+        if "No space left on device" in str(e):
+            print("[DISK] No space left. Revisa volumen/cachés. Estado actual:", flush=True)
+            _print_space()
+        print("[ERROR] OSError:\n" + traceback.format_exc(), flush=True)
         return {"ok": False, "error": str(e)}
     except Exception as e:
         print("[ERROR] Exception:\n" + traceback.format_exc(), flush=True)
         return {"ok": False, "error": str(e)}
 
-
-# -------------------------
-# Arranque del worker RPOD
-# -------------------------
+# Arranque del worker
 runpod.serverless.start({"handler": handler})
 
-
-# -----------------
 # Test local opcional
-# -----------------
 if __name__ == "__main__":
     print(handler({"input": {"prompt": "pikachu inspired minecraft skin", "seed": 42}}))

@@ -1,4 +1,4 @@
-# handler.py — RunPod Serverless con logs, cache HF, carga perezosa y scheduler robusto
+# handler.py — RunPod Serverless con logs, cache HF, carga perezosa y scheduler blindado
 import os, io, base64, time, traceback
 import torch
 import runpod
@@ -59,47 +59,42 @@ print(
 
 PIPE = None
 
+
 # --------------------
-# Helpers de scheduler
+# Scheduler blindado
 # --------------------
-def _ensure_scheduler(pipe):
+def _attach_scheduler(pipe):
     """
-    Asegura que pipe.scheduler exista.
-    1) Si viene en el checkpoint -> recrea DPMSolverMultiStep con use_karras.
-    2) Si no existe -> intenta cargar subfolder 'scheduler'.
-    3) Si tampoco -> crea uno por defecto.
+    NO leemos .config de ningún sitio para evitar 'NoneType.config'.
+    1) Intento: cargar desde subfolder 'scheduler' del repo.
+    2) Fallback: crear DPMSolverMultistepScheduler con params típicos SDXL.
     """
+    # Intento desde el repo (subfolder)
     try:
-        if getattr(pipe, "scheduler", None) is not None and getattr(pipe.scheduler, "config", None) is not None:
-            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                pipe.scheduler.config, use_karras=True
-            )
-            print("[SCHED] from current config + karras", flush=True)
-            return
-
-        # Intento desde el repo (subfolder)
-        try:
-            pipe.scheduler = DPMSolverMultistepScheduler.from_pretrained(
-                MODEL_ID, subfolder="scheduler", use_karras=True, revision=MODEL_REVISION, token=HF_TOKEN
-            )
-            print("[SCHED] from_pretrained(subfolder='scheduler')", flush=True)
-            return
-        except Exception as e_sub:
-            print(f"[SCHED] subfolder load failed: {e_sub}", flush=True)
-
-        # Fallback parámetros típicos de SDXL
-        pipe.scheduler = DPMSolverMultistepScheduler(
-            beta_start=0.00085,
-            beta_end=0.012,
-            beta_schedule="scaled_linear",
-            algorithm_type="dpmsolver++",
+        sch = DPMSolverMultistepScheduler.from_pretrained(
+            MODEL_ID, subfolder="scheduler",
             use_karras=True,
-            steps_offset=1
+            revision=MODEL_REVISION,
+            token=HF_TOKEN
         )
-        print("[SCHED] fallback DPMSolverMultistepScheduler (defaults)", flush=True)
-    except Exception:
-        print("[SCHED][ERROR] No se pudo configurar scheduler:\n" + traceback.format_exc(), flush=True)
-        raise
+        pipe.scheduler = sch
+        print("[SCHED] from_pretrained(subfolder='scheduler')", flush=True)
+        return
+    except Exception as e_sub:
+        print(f"[SCHED] subfolder load failed, uso fallback: {e_sub}", flush=True)
+
+    # Fallback sin depender de .config
+    pipe.scheduler = DPMSolverMultistepScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.00085,
+        beta_end=0.012,
+        beta_schedule="scaled_linear",
+        algorithm_type="dpmsolver++",
+        use_karras=True,
+        steps_offset=1
+    )
+    print("[SCHED] fallback DPMSolverMultistepScheduler (defaults SDXL)", flush=True)
+
 
 # =========================
 # Carga perezosa del modelo
@@ -118,7 +113,7 @@ def _load_pipe():
             vae = AutoencoderKL.from_pretrained(
                 VAE_ID, torch_dtype=DTYPE, token=HF_TOKEN
             )
-            print("[LOAD] VEA/AE cargado", flush=True)
+            print("[LOAD] VAE cargado", flush=True)
         except Exception as e:
             print(f"[WARN] Fallo cargando VAE '{VAE_ID}': {e}", flush=True)
 
@@ -133,8 +128,8 @@ def _load_pipe():
             token=HF_TOKEN
         )
 
-        # Scheduler robusto
-        _ensure_scheduler(pipe)
+        # Scheduler SIEMPRE sin tocar .config
+        _attach_scheduler(pipe)
 
         # Silenciar cosas innecesarias
         if hasattr(pipe, "watermark"):   pipe.watermark = None
@@ -168,6 +163,7 @@ def _load_pipe():
         print("[ERROR] Falla cargando pipeline:\n" + traceback.format_exc(), flush=True)
         raise
 
+
 # ===================
 # Utilidades de imagen
 # ===================
@@ -199,6 +195,7 @@ def _img_to_png(img: Image.Image) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
 
 # ==================
 # RunPod: main handler
@@ -266,10 +263,12 @@ def handler(event):
         print("[ERROR] Exception:\n" + traceback.format_exc(), flush=True)
         return {"ok": False, "error": str(e)}
 
+
 # ========================
 # Arranque del worker RPOD
 # ========================
 runpod.serverless.start({"handler": handler})
+
 
 # ==================
 # Test local opcional

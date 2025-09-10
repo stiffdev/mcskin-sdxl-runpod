@@ -1,4 +1,4 @@
-# handler.py — RunPod Serverless con logs, cache HF y carga perezosa
+# handler.py — RunPod Serverless con logs, cache HF, carga perezosa y scheduler robusto
 import os, io, base64, time, traceback
 import torch
 import runpod
@@ -10,10 +10,9 @@ try:
 except Exception:
     AutoencoderKL = None
 
-# =========================================================
-# Parcheos de entorno/descargas antes de cargar nada pesado
-# =========================================================
-# Desactiva hf_transfer si está habilitado en ENV pero no instalado
+# =========================
+# Parcheo hf_transfer (logs)
+# =========================
 if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
     try:
         import hf_transfer  # noqa: F401
@@ -22,7 +21,6 @@ if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
         print("[BOOT] HF_HUB_ENABLE_HF_TRANSFER=1 pero 'hf_transfer' no está instalado -> lo desactivo", flush=True)
 
-# Cache de HF persistente (recomendado montar volumen en /runpod-volume/hf-cache)
 HF_CACHE = os.getenv("HUGGINGFACE_HUB_CACHE")
 if HF_CACHE:
     try:
@@ -31,16 +29,15 @@ if HF_CACHE:
     except Exception as _e:
         print(f"[WARN] No pude crear cache dir {HF_CACHE}: {_e}", flush=True)
 
-# Ahorro de memoria y ruido
 torch.set_grad_enabled(False)
 
-# ==================================
-# Config (ENV con valores por defecto)
-# ==================================
+# =================
+# Config por ENV
+# =================
 MODEL_ID       = os.getenv("MODEL_ID", "monadical-labs/minecraft-skin-generator-sdxl")
-MODEL_REVISION = os.getenv("MODEL_REVISION")  # opcional: tag/sha de HF
-VAE_ID         = os.getenv("VAE_ID")          # opcional: ej. stabilityai/sdxl-vae-fp16-fix
-HF_TOKEN       = os.getenv("HF_TOKEN")        # opcional si el repo fuese privado
+MODEL_REVISION = os.getenv("MODEL_REVISION")
+VAE_ID         = os.getenv("VAE_ID")
+HF_TOKEN       = os.getenv("HF_TOKEN")
 
 HEIGHT   = int(os.getenv("GEN_HEIGHT", "768"))
 WIDTH    = int(os.getenv("GEN_WIDTH",  "768"))
@@ -50,26 +47,68 @@ STEPS    = int(os.getenv("STEPS",     "30"))
 DTYPE  = torch.float16
 DEVICE = "cuda"
 
-# Reproducibilidad (si te va lento, quita deterministic=True)
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
 print(
     f"[BOOT] torch={torch.__version__} "
-    f"cuda_available={torch.cuda.is_available()} "
-    f"device={DEVICE} gpu={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}",
+    f"cuda={torch.cuda.is_available()} "
+    f"gpu={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}",
     flush=True
 )
+
+PIPE = None
+
+# --------------------
+# Helpers de scheduler
+# --------------------
+def _ensure_scheduler(pipe):
+    """
+    Asegura que pipe.scheduler exista.
+    1) Si viene en el checkpoint -> recrea DPMSolverMultiStep con use_karras.
+    2) Si no existe -> intenta cargar subfolder 'scheduler'.
+    3) Si tampoco -> crea uno por defecto.
+    """
+    try:
+        if getattr(pipe, "scheduler", None) is not None and getattr(pipe.scheduler, "config", None) is not None:
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                pipe.scheduler.config, use_karras=True
+            )
+            print("[SCHED] from current config + karras", flush=True)
+            return
+
+        # Intento desde el repo (subfolder)
+        try:
+            pipe.scheduler = DPMSolverMultistepScheduler.from_pretrained(
+                MODEL_ID, subfolder="scheduler", use_karras=True, revision=MODEL_REVISION, token=HF_TOKEN
+            )
+            print("[SCHED] from_pretrained(subfolder='scheduler')", flush=True)
+            return
+        except Exception as e_sub:
+            print(f"[SCHED] subfolder load failed: {e_sub}", flush=True)
+
+        # Fallback parámetros típicos de SDXL
+        pipe.scheduler = DPMSolverMultistepScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            algorithm_type="dpmsolver++",
+            use_karras=True,
+            steps_offset=1
+        )
+        print("[SCHED] fallback DPMSolverMultistepScheduler (defaults)", flush=True)
+    except Exception:
+        print("[SCHED][ERROR] No se pudo configurar scheduler:\n" + traceback.format_exc(), flush=True)
+        raise
 
 # =========================
 # Carga perezosa del modelo
 # =========================
-PIPE = None
-
 def _load_pipe():
     global PIPE
     if PIPE is not None:
         return PIPE
+
     t0 = time.time()
     print(f"[LOAD] Cargando modelo: {MODEL_ID} (rev={MODEL_REVISION}) VAE={VAE_ID}", flush=True)
 
@@ -77,11 +116,9 @@ def _load_pipe():
     if VAE_ID and AutoencoderKL is not None:
         try:
             vae = AutoencoderKL.from_pretrained(
-                VAE_ID,
-                torch_dtype=DTYPE,
-                token=HF_TOKEN
+                VAE_ID, torch_dtype=DTYPE, token=HF_TOKEN
             )
-            print("[LOAD] VAE cargado", flush=True)
+            print("[LOAD] VEA/AE cargado", flush=True)
         except Exception as e:
             print(f"[WARN] Fallo cargando VAE '{VAE_ID}': {e}", flush=True)
 
@@ -96,19 +133,15 @@ def _load_pipe():
             token=HF_TOKEN
         )
 
-        # Scheduler estable y rápido
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-            pipe.scheduler.config, use_karras=True
-        )
+        # Scheduler robusto
+        _ensure_scheduler(pipe)
 
-        # Silenciar watermarker/safety checker
+        # Silenciar cosas innecesarias
         if hasattr(pipe, "watermark"):   pipe.watermark = None
         if hasattr(pipe, "watermarker"): pipe.watermarker = None
         if hasattr(pipe, "safety_checker"):
-            try:
-                pipe.safety_checker = None
-            except Exception:
-                pass
+            try: pipe.safety_checker = None
+            except Exception: pass
 
         pipe.set_progress_bar_config(disable=True)
         pipe.to(DEVICE)
@@ -119,11 +152,17 @@ def _load_pipe():
         except Exception as e:
             print(f"[WARN] xformers no habilitado: {e}", flush=True)
 
-        # Memoria
         pipe.enable_vae_slicing()
 
-        PIPE = pipe
+        # Debug mínimo de componentes
+        try:
+            comps = list(getattr(pipe, "components", {}).keys())
+            print(f"[LOAD] components={comps}", flush=True)
+        except Exception:
+            pass
+
         print(f"[LOAD] Modelo listo en {time.time() - t0:.1f}s", flush=True)
+        PIPE = pipe
         return PIPE
     except Exception:
         print("[ERROR] Falla cargando pipeline:\n" + traceback.format_exc(), flush=True)
@@ -133,14 +172,12 @@ def _load_pipe():
 # Utilidades de imagen
 # ===================
 def _to_skin_64_png(hi: Image.Image) -> bytes:
-    # Crop a cuadrado desde la esquina superior izquierda (coincide con comportamiento previo)
     if hi.width != hi.height:
         s = min(hi.width, hi.height)
         hi = hi.crop((0, 0, s, s))
     if hi.mode != "RGBA":
         hi = hi.convert("RGBA")
 
-    # Downscale con muestreo de punto "centrado" para conservar pixel art
     scale = max(1, hi.width // 64)
     if scale >= 2:
         lo = Image.new("RGBA", (64, 64))
@@ -197,7 +234,6 @@ def handler(event):
         if seed is not None:
             gen = gen.manual_seed(int(seed))
 
-        # Inferencia sin grafo (menos VRAM y más estable)
         with torch.inference_mode():
             out = pipe(
                 prompt=prompt,

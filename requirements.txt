@@ -7,4 +7,5 @@ huggingface_hub==0.24.6
 numpy==1.26.4
 scipy==1.12.0
 Pillow==10.3.0
+hf_transfer==0.1.6
 runpod==1.6.2

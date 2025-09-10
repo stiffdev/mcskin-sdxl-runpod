@@ -1,16 +1,14 @@
-# handler.py — RunPod Serverless con caché en volumen, logs de espacio y carga perezosa
+# handler.py — RunPod Serverless: caché en volumen + scheduler defensivo (sin .config)
 import os, io, base64, time, traceback, tempfile, shutil
 import torch
 import runpod
 from PIL import Image
 
 # ---------- RUTAS DE CACHÉ Y TMP EN EL VOLUMEN ----------
-# Si en RunPod montaste un volumen en /runpod-volume, lo usamos para TODO:
-VOLUME_ROOT = os.getenv("VOLUME_ROOT", "/runpod-volume")  # cambia si montaste otro path
+VOLUME_ROOT = os.getenv("VOLUME_ROOT", "/runpod-volume")
 HF_CACHE_DIR = os.path.join(VOLUME_ROOT, "hf-cache")
 TMP_DIR      = os.path.join(VOLUME_ROOT, "tmp")
 
-# Exporta variables de entorno ANTES de cargar nada de diffusers/transformers
 os.makedirs(HF_CACHE_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
 
@@ -20,16 +18,13 @@ os.environ.setdefault("TRANSFORMERS_CACHE", HF_CACHE_DIR)
 os.environ.setdefault("DIFFUSERS_CACHE", HF_CACHE_DIR)
 os.environ.setdefault("TORCH_HOME", HF_CACHE_DIR)
 
-# IMPORTANTÍSIMO: manda todos los temporales a tu volumen (no /tmp del root)
 os.environ.setdefault("TMPDIR", TMP_DIR)
 os.environ.setdefault("TEMP", TMP_DIR)
 os.environ.setdefault("TMP", TMP_DIR)
 
-# Opcionales recomendados
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-# Si no tienes hf_transfer instalado, mejor desactivar explicitamente:
+# Evita error de hf_transfer si no está instalado
 if os.getenv("HF_HUB_ENABLE_HF_TRANSFER") == "1":
-    # Si no está instalado, apágalo para evitar error de descarga
     try:
         import hf_transfer  # noqa: F401
     except Exception:
@@ -45,7 +40,7 @@ except Exception:
 # -------- Config ----------
 MODEL_ID       = os.getenv("MODEL_ID", "monadical-labs/minecraft-skin-generator-sdxl")
 MODEL_REVISION = os.getenv("MODEL_REVISION")  # opcional
-VAE_ID         = os.getenv("VAE_ID")          # opcional, ej: "stabilityai/sdxl-vae-fp16-fix"
+VAE_ID         = os.getenv("VAE_ID")          # opcional, ej: stabilityai/sdxl-vae-fp16-fix
 HF_TOKEN       = os.getenv("HF_TOKEN")        # opcional si repo privado
 
 HEIGHT   = int(os.getenv("GEN_HEIGHT", "768"))
@@ -56,7 +51,6 @@ STEPS    = int(os.getenv("STEPS",     "30"))
 DTYPE  = torch.float16
 DEVICE = "cuda"
 
-# Determinismo (evita kernels raros que hagan más tmp)
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
@@ -85,6 +79,26 @@ print(f"[PATHS] HF_CACHE_DIR={HF_CACHE_DIR} TMP_DIR={TMP_DIR}", flush=True)
 
 PIPE = None
 
+def _safe_set_scheduler(pipe):
+    """
+    No uses pipe.scheduler.config. Si no hay scheduler, crea DPMSolverMultistepScheduler()
+    con valores por defecto (sin from_config).
+    """
+    try:
+        if getattr(pipe, "scheduler", None) is None:
+            print("[SCHED] pipeline.sheduler is None -> creating DPMSolverMultistepScheduler()", flush=True)
+            pipe.scheduler = DPMSolverMultistepScheduler()  # defaults internos
+        else:
+            # Si existe, mejor no tocarlo para evitar .config en repos sin scheduler válido.
+            print(f"[SCHED] using existing scheduler class={pipe.scheduler.__class__.__name__}", flush=True)
+    except Exception as e:
+        print(f"[SCHED][WARN] failed to ensure scheduler: {e}. Falling back to new DPMSolverMultistepScheduler().", flush=True)
+        try:
+            pipe.scheduler = DPMSolverMultistepScheduler()
+        except Exception as ee:
+            print(f"[SCHED][ERROR] fallback scheduler creation failed: {ee}", flush=True)
+            raise
+
 def _load_pipe():
     global PIPE
     if PIPE is not None:
@@ -96,10 +110,7 @@ def _load_pipe():
     if VAE_ID and AutoencoderKL is not None:
         try:
             vae = AutoencoderKL.from_pretrained(
-                VAE_ID,
-                torch_dtype=DTYPE,
-                cache_dir=HF_CACHE_DIR,
-                token=HF_TOKEN
+                VAE_ID, torch_dtype=DTYPE, cache_dir=HF_CACHE_DIR, token=HF_TOKEN
             )
             print("[LOAD] VAE loaded", flush=True)
         except Exception as e:
@@ -114,32 +125,18 @@ def _load_pipe():
             use_safetensors=True,
             add_watermarker=None,
             token=HF_TOKEN,
-            cache_dir=HF_CACHE_DIR,          # <-- forzamos descarga al volumen
+            cache_dir=HF_CACHE_DIR,
             local_files_only=False
         )
 
-        # Scheduler defensivo (evita el 'NoneType has no attribute config')
-        try:
-            if getattr(pipe, "scheduler", None) is None:
-                print("[LOAD] scheduler is None; creating DPMSolver...", flush=True)
-                pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                    {"num_train_timesteps": 1000, "solver_order": 2, "prediction_type": "epsilon"},
-                    use_karras=True
-                )
-            else:
-                pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                    pipe.scheduler.config, use_karras=True
-                )
-        except Exception as se:
-            print(f"[WARN] could not set DPMSolver: {se}; using default", flush=True)
+        # Scheduler defensivo (SIN tocar .config)
+        _safe_set_scheduler(pipe)
 
-        # Desactiva watermark/safety
+        # Desactiva watermark/safety si existen
         for attr in ("watermark", "watermarker", "safety_checker"):
             if hasattr(pipe, attr):
-                try:
-                    setattr(pipe, attr, None)
-                except Exception:
-                    pass
+                try: setattr(pipe, attr, None)
+                except Exception: pass
 
         pipe.to(DEVICE)
         try:
@@ -149,16 +146,16 @@ def _load_pipe():
 
         pipe.enable_vae_slicing()
 
-        PIPE = pipe
         print(f"[LOAD] Model ready in {time.time()-t0:.1f}s", flush=True)
         _print_space()
+        PIPE = pipe
         return PIPE
-    except Exception as e:
+
+    except Exception:
         print("[ERROR] Pipeline load failed:\n" + traceback.format_exc(), flush=True)
-        # Si se quedó basura parcial, intenta limpiar cache incompleta (sólo si hay poco espacio)
         try:
             _print_space()
-            # Limpieza selectiva de tmp si hace falta
+            # Limpia temporales si quedó algo corrupto ocupando espacio
             if os.path.isdir(TMP_DIR):
                 for name in os.listdir(TMP_DIR):
                     p = os.path.join(TMP_DIR, name)
@@ -181,7 +178,6 @@ def _to_skin_64_png(hi: Image.Image) -> bytes:
     if hi.mode != "RGBA":
         hi = hi.convert("RGBA")
 
-    # Reescalado respetando "pixel-art"
     scale = max(1, hi.width // 64)
     if scale >= 2:
         lo = Image.new("RGBA", (64, 64))
@@ -213,7 +209,6 @@ def handler(event):
       width/height (opc; por defecto ENV)
       return_64x64 (bool, opc; default True)
     """
-    # Asegura que tempfile también use TMP_DIR dentro del volumen
     tempfile.tempdir = TMP_DIR
 
     try:
@@ -248,14 +243,13 @@ def handler(event):
 
         png_bytes = _to_skin_64_png(img) if r64 else _img_to_png(img)
         b64 = base64.b64encode(png_bytes).decode("utf-8")
-        result = {
+        print("[RUN] done", flush=True)
+        return {
             "ok": True,
             "w": 64 if r64 else img.width,
             "h": 64 if r64 else img.height,
             "image_b64": b64
         }
-        print("[RUN] done", flush=True)
-        return result
 
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):

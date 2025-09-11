@@ -14,5 +14,6 @@ ENV HF_HOME=/models \
 
 WORKDIR /app
 COPY handler.py /app
+COPY mapper.py /app
 
 CMD ["python", "-u", "handler.py"]

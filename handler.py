@@ -1,42 +1,41 @@
-# handler.py — RunPod Serverless SDXL → Minecraft Skin (64×64) estable
-import os, io, base64, time, traceback, fcntl, shutil, collections
+# handler.py — RunPod Serverless SDXL → Minecraft Skin (64×64) con layout forcing + matte
+import os, io, base64, time, traceback, fcntl, shutil
 import torch
 import runpod
 from PIL import Image
+from collections import Counter
 from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
 try:
     from diffusers import AutoencoderKL
 except Exception:
     AutoencoderKL = None
 
-# ----------------- ENV sane defaults + cache persistente -----------------
+# --------- ENV / Cache ----------
 HF_HOME = os.getenv("HF_HOME", "/runpod-volume/.cache/huggingface")
 os.makedirs(HF_HOME, exist_ok=True)
 os.environ.setdefault("HF_HOME", HF_HOME)
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", HF_HOME)
 os.environ.setdefault("HF_DATASETS_CACHE", HF_HOME)
 
-# Si HF transfer no está instalado, no lo uses (evita fallo de import)
+# Apaga hf_transfer si no está instalado
 if os.getenv("HF_HUB_ENABLE_HF_TRANSFER") == "1":
     try:
-        import hf_transfer  # noqa: F401
+        import hf_transfer  # noqa
     except Exception:
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-# ----------------- Configurable por ENV -----------------
+# --------- Modelo ----------
 MODEL_ID       = os.getenv("MODEL_ID", "monadical-labs/minecraft-skin-generator-sdxl")
 MODEL_REVISION = os.getenv("MODEL_REVISION")  # opcional
-DEFAULT_VAE_ID = "madebyollin/sdxl-vae-fp16-fix"    # estable para SDXL fp16
+DEFAULT_VAE_ID = "madebyollin/sdxl-vae-fp16-fix"
 VAE_ID         = os.getenv("VAE_ID", DEFAULT_VAE_ID)
-HF_TOKEN       = os.getenv("HF_TOKEN")              # si fuese privado
+HF_TOKEN       = os.getenv("HF_TOKEN")
 
-# MUY IMPORTANTE: SDXL de ese repo se comporta mejor a 1024
+# --------- Parámetros por defecto (forzamos 1024) ----------
 HEIGHT   = int(os.getenv("GEN_HEIGHT", "1024"))
 WIDTH    = int(os.getenv("GEN_WIDTH",  "1024"))
-
-# Los valores de CFG/steps que mejor mantienen el layout
-GUIDANCE = float(os.getenv("GUIDANCE", "3.0"))   # CFG bajito ayuda al atlas
-STEPS    = int(os.getenv("STEPS",     "30"))
+GUIDANCE = float(os.getenv("GUIDANCE", "5.0"))
+STEPS    = int(os.getenv("STEPS",     "28"))
 
 DTYPE  = torch.float16
 DEVICE = "cuda"
@@ -44,18 +43,30 @@ DEVICE = "cuda"
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
-def _gpu_name():
-    try: return torch.cuda.get_device_name(0)
-    except: return "cpu"
-
 print(f"[BOOT] torch={torch.__version__} cuda={torch.cuda.is_available()} "
-      f"dev={DEVICE} name={_gpu_name()}", flush=True)
+      f"dev={DEVICE} name={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}",
+      flush=True)
 
 PIPE = None
 _LOCK_FPATH = "/runpod-volume/sdxl_init.lock"
 os.makedirs(os.path.dirname(_LOCK_FPATH), exist_ok=True)
 
-# ----------------- Utilidades -----------------
+# --------- Prompt forcing ----------
+PROMPT_SUFFIX = (
+    " minecraft skin texture sheet, 64x64 game texture UV layout, "
+    "front back left right views arranged, head top bottom left right front back, "
+    "body torso arms legs mapped to template, pixel art, clean flat shading, high-contrast, "
+    "no background, transparent background, template aligned, centered, full character, "
+    "video game asset, texture atlas"
+)
+
+NEGATIVE_BASE = (
+    "photo, realistic, 3d render, background, scenery, text, watermark, signature, "
+    "portrait only, single face close-up, disorganized layout, collage, canvas, border, "
+    "blurry, noisy, low-res, artifacts, misaligned, cut-off limbs, wrong aspect"
+)
+
+# --------- Utils ----------
 def _disk_log():
     try:
         total, used, free = shutil.disk_usage("/")
@@ -69,14 +80,9 @@ def _force_load_vae():
     if AutoencoderKL is None:
         return None
     print(f"[LOAD] Loading VAE: {VAE_ID}", flush=True)
-    return AutoencoderKL.from_pretrained(
-        VAE_ID, torch_dtype=DTYPE, use_safetensors=True, token=HF_TOKEN
-    )
+    return AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=DTYPE, use_safetensors=True, token=HF_TOKEN)
 
 def _load_pipe():
-    """
-    Carga única con lock. VAE forzado para evitar `NoneType.config`.
-    """
     global PIPE
     if PIPE is not None:
         return PIPE
@@ -111,20 +117,15 @@ def _load_pipe():
             print("[ERROR] SDXL from_pretrained failed:\n" + traceback.format_exc(), flush=True)
             raise
 
-        # Si por lo que sea no quedó VAE:
         if getattr(pipe, "vae", None) is None:
-            print("[FIX] Pipeline arrived without VAE, forcing attach...", flush=True)
+            print("[FIX] Pipeline without VAE, forcing attach...", flush=True)
             pipe.vae = _force_load_vae()
 
-        # Scheduler Karras para SDXL
         try:
-            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                pipe.scheduler.config, use_karras=True
-            )
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config, use_karras=True)
         except Exception as e:
             print(f"[WARN] Scheduler reuse failed: {e}. Using default.", flush=True)
 
-        # Desactivar “extras”
         for attr in ("watermark", "watermarker", "safety_checker"):
             if hasattr(pipe, attr):
                 try:
@@ -144,115 +145,90 @@ def _load_pipe():
         fcntl.flock(lockf, fcntl.LOCK_UN)
         return PIPE
 
-# ----------------- Mapper / Post-proc -----------------
-def _most_common_color(img: Image.Image) -> tuple:
+def _matte_background_to_alpha(img_rgba: Image.Image, tol: int = 18) -> Image.Image:
     """
-    Encuentra el color de fondo dominante (ignorando zonas muy pequeñas).
-    Trabajamos sobre una imagen reducida para ser rápidos.
+    Elimina el fondo casi uniforme (gris/rosa) convirtiéndolo a alfa=0.
+    Toma el color más frecuente del borde y quita píxeles similares (tolerancia Euclídea).
     """
-    small = img.resize((64, 64), Image.NEAREST).convert("RGBA")
-    cnt = collections.Counter(small.getdata())
-    # ignorar transparencia si ya la hubiera
-    cnt.pop((0,0,0,0), None)
-    return cnt.most_common(1)[0][0] if cnt else (0, 0, 0, 255)
+    if img_rgba.mode != "RGBA":
+        img_rgba = img_rgba.convert("RGBA")
 
-def _make_bg_transparent(img: Image.Image) -> Image.Image:
-    """
-    Heurística robusta: toma el color dominante de fondo y lo hace transparente
-    con tolerancia (por si el fondo varía un poco).
-    """
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-    bg = _most_common_color(img)
-    px = img.load()
-    w, h = img.size
-    tol = 18  # tolerancia en cada canal
+    w, h = img_rgba.size
+    pix = img_rgba.load()
+
+    border_colors = []
+    for x in range(w):
+        border_colors.append(pix[x, 0][:3])
+        border_colors.append(pix[x, h-1][:3])
+    for y in range(h):
+        border_colors.append(pix[0, y][:3])
+        border_colors.append(pix[w-1, y][:3])
+
+    (bg_r, bg_g, bg_b), _ = Counter(border_colors).most_common(1)[0]
+
+    def close(c):
+        dr = c[0] - bg_r
+        dg = c[1] - bg_g
+        db = c[2] - bg_b
+        return (dr*dr + dg*dg + db*db) ** 0.5 <= tol
+
+    out = Image.new("RGBA", (w, h))
+    out_pix = out.load()
     for y in range(h):
         for x in range(w):
-            r, g, b, a = px[x, y]
-            if (abs(r - bg[0]) <= tol and
-                abs(g - bg[1]) <= tol and
-                abs(b - bg[2]) <= tol):
-                px[x, y] = (r, g, b, 0)  # transparente
-    return img
+            r, g, b, a = pix[x, y]
+            if close((r, g, b)):
+                out_pix[x, y] = (r, g, b, 0)
+            else:
+                out_pix[x, y] = (r, g, b, a)
+    return out
 
-def _to_skin_64_png(hi: Image.Image) -> bytes:
-    """
-    Reescalado a 64×64 con NEAREST + limpieza de fondo para transparencia.
-    """
-    # forzar cuadrado por si el modelo devuelve 1024×768 o similar
-    if hi.width != hi.height:
-        s = min(hi.width, hi.height)
-        hi = hi.crop((0, 0, s, s))
-    hi = _make_bg_transparent(hi)
+def _downscale_to_skin64(img: Image.Image) -> Image.Image:
+    """Baja a 64×64 con vecino más cercano (mantiene píxel nítido)."""
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    # Asegura cuadrado (por si el modelo devuelve 1024 no-crop)
+    s = min(img.width, img.height)
+    if img.width != img.height:
+        img = img.crop((0, 0, s, s))
+    return img.resize((64, 64), resample=Image.NEAREST)
 
-    lo = hi.resize((64, 64), resample=Image.NEAREST)
-    if lo.mode != "RGBA":
-        lo = lo.convert("RGBA")
-    buf = io.BytesIO()
-    lo.save(buf, format="PNG")
-    return buf.getvalue()
-
-def _img_to_png(img: Image.Image) -> bytes:
+def _img_to_png_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-# ----------------- Prompt helper -----------------
-_BASE_POSITIVE = (
-    "minecraft skin texture atlas, character skin UV layout, head body arms legs, "
-    "front back left right faces arranged correctly, pixel art style, clean edges, "
-    "no background, transparent background, plain template, 64x64 compatible"
-)
-_BASE_NEGATIVE = (
-    "wrong layout, misaligned atlas, cropped, photo, 3d render, perspective, watermark, "
-    "text, logo, ui, extra limbs, background, shadows, noise, blurry, jpeg artifacts"
-)
-
-def _compose_prompts(user_prompt: str):
-    # SDXL acepta prompt principal y prompt_2 (de estilo). Damos el base en ambos.
-    p = f"{user_prompt}, {_BASE_POSITIVE}"
-    p2 = "flat pixel art, simple color palette, clean lines, high contrast"
-    n = _BASE_NEGATIVE
-    return p, p2, n
-
-# ----------------- RunPod handler -----------------
+# ------------- RunPod handler -------------
 def handler(event):
     """
     input:
       prompt (str)
-      negative_prompt (str, opc)
+      negative_prompt (str, opc; se une a NEGATIVE_BASE)
       seed (int, opc)
       steps (int, opc)
       guidance (float, opc)
-      width/height (opc; por defecto ENV - usar 1024x1024)
+      width/height (opc; default 1024)
       return_64x64 (bool, opc; default True)
+      matte_bg (bool, opc; default True) — eliminar fondo a transparente
     """
     try:
         inp = event.get("input", {}) or {}
         user_prompt = inp.get("prompt", "minecraft skin")
-        neg_user    = inp.get("negative_prompt") or None
+        neg_extra   = (inp.get("negative_prompt") or "").strip()
         steps       = int(inp.get("steps", STEPS))
         guidance    = float(inp.get("guidance", GUIDANCE))
         width       = int(inp.get("width",  WIDTH))
         height      = int(inp.get("height", HEIGHT))
         r64         = bool(inp.get("return_64x64", True))
+        matte_bg    = bool(inp.get("matte_bg", True))
         seed        = inp.get("seed")
 
-        # Recomendación dura: 1024x1024
-        if width != height:
-            m = min(width, height)
-            width = height = m
-        if width < 1024:
-            width = height = 1024
+        # Forzar prompts que describen el layout de skin
+        prompt_full = f"{user_prompt.strip()}, {PROMPT_SUFFIX}"
+        negative_full = NEGATIVE_BASE if not neg_extra else (NEGATIVE_BASE + ", " + neg_extra)
 
-        pp, pp2, nn = _compose_prompts(user_prompt)
-        if neg_user:
-            nn = f"{nn}, {neg_user}"
-
-        print(f"[RUN] prompt='{user_prompt[:120]}' steps={steps} "
-              f"guidance={guidance} size={width}x{height} seed={seed}", flush=True)
-
+        print(f"[RUN] steps={steps} guidance={guidance} size={width}x{height} seed={seed}", flush=True)
+        print(f"[PROMPT] {prompt_full[:180]}", flush=True)
         pipe = _load_pipe()
 
         gen = torch.Generator(device=DEVICE)
@@ -260,9 +236,8 @@ def handler(event):
             gen = gen.manual_seed(int(seed))
 
         out = pipe(
-            prompt=pp,
-            prompt_2=pp2,                # SDXL dual prompt para estilo
-            negative_prompt=nn,
+            prompt=prompt_full,
+            negative_prompt=negative_full,
             width=width, height=height,
             guidance_scale=guidance,
             num_inference_steps=steps,
@@ -270,15 +245,19 @@ def handler(event):
         )
         img = out.images[0]
 
-        png_bytes = _to_skin_64_png(img) if r64 else _img_to_png(img)
+        if matte_bg:
+            img = _matte_background_to_alpha(img, tol=18)
+
+        if r64:
+            img = _downscale_to_skin64(img)
+
+        png_bytes = _img_to_png_bytes(img)
         b64 = base64.b64encode(png_bytes).decode("utf-8")
-        return {"ok": True,
-                "w": 64 if r64 else img.width,
-                "h": 64 if r64 else img.height,
-                "image_b64": b64}
+        return {"ok": True, "w": img.width, "h": img.height, "image_b64": b64}
+
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
-            msg = "CUDA OOM: baja GEN_WIDTH/GEN_HEIGHT a 1024 (ya está), steps a 20–25, y pon Concurrency=1"
+            msg = "CUDA OOM: baja GEN_WIDTH/GEN_HEIGHT a 640 o 512, steps a 22–25, y pon Concurrency=1"
             print(f"[OOM] {msg}", flush=True)
             return {"ok": False, "error": msg}
         print("[ERROR] RuntimeError:\n" + traceback.format_exc(), flush=True)
@@ -290,6 +269,9 @@ def handler(event):
 # Arranque del worker
 runpod.serverless.start({"handler": handler})
 
-# Prueba local opcional
+# Test local opcional
 if __name__ == "__main__":
-    print(handler({"input": {"prompt": "donald trump suit, usa flag motif", "seed": 42}}))
+    print(handler({"input": {
+        "prompt": "donald trump in a navy suit with red tie, stylized",
+        "seed": 42
+    }}))

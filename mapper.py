@@ -1,28 +1,33 @@
+# mapper.py — limpieza de fondo + downscale 64x64 con NEAREST
 from PIL import Image
-import io
+import io, collections
+
+def _most_common_color(img: Image.Image) -> tuple:
+    small = img.resize((64, 64), Image.NEAREST).convert("RGBA")
+    cnt = collections.Counter(small.getdata())
+    cnt.pop((0,0,0,0), None)
+    return cnt.most_common(1)[0][0] if cnt else (0, 0, 0, 255)
+
+def _make_bg_transparent(img: Image.Image) -> Image.Image:
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    bg = _most_common_color(img)
+    px = img.load()
+    w, h = img.size
+    tol = 18
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            if (abs(r - bg[0]) <= tol and abs(g - bg[1]) <= tol and abs(b - bg[2]) <= tol):
+                px[x, y] = (r, g, b, 0)
+    return img
 
 def to_skin_64_png(highres_img: Image.Image) -> bytes:
-    """
-    Toma la “skin sheet” de alta resolución (p. ej. 768×768) y la convierte
-    en una textura 64×64 apta para Minecraft (pre-1.8/1.8 layout).
-    """
-    # Validación básica cuadrada
     if highres_img.width != highres_img.height:
-        # Algunos pipelines SDXL devuelven 1024 si no se fuerza 768: ajustamos por si acaso
-        size = min(highres_img.width, highres_img.height)
-        box  = (0, 0, size, size)
-        hi   = highres_img.crop(box)
-    else:
-        hi = highres_img
-
-    # Asegurar RGBA para transparencia de overlay
-    if hi.mode != "RGBA":
-        hi = hi.convert("RGBA")
-
-    # Downscale con vecino más cercano (evita anti-aliasing)
-    skin64 = hi.resize((64, 64), resample=Image.NEAREST)
-
-    # Guardar a PNG bytes
+        s = min(highres_img.width, highres_img.height)
+        highres_img = highres_img.crop((0, 0, s, s))
+    hi = _make_bg_transparent(highres_img)
+    skin64 = hi.resize((64, 64), resample=Image.NEAREST).convert("RGBA")
     buf = io.BytesIO()
     skin64.save(buf, format="PNG")
     return buf.getvalue()

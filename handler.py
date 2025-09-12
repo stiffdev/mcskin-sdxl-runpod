@@ -3,48 +3,33 @@ import os, io, base64, time, traceback, fcntl, shutil
 import runpod
 import torch
 from PIL import Image
+from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
 
-# Caches de HF en volumen persistente
+# Mapper local
+from mapper import to_skin_layout
+
+try:
+    from diffusers import AutoencoderKL
+except Exception:
+    AutoencoderKL = None
+
+# --------- ENV sane defaults ----------
 HF_HOME = os.getenv("HF_HOME", "/runpod-volume/.cache/huggingface")
 os.makedirs(HF_HOME, exist_ok=True)
 os.environ.setdefault("HF_HOME", HF_HOME)
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", HF_HOME)
 os.environ.setdefault("HF_DATASETS_CACHE", HF_HOME)
 
-# Desactiva hf_transfer si no está instalado (evita error)
 if os.getenv("HF_HUB_ENABLE_HF_TRANSFER") == "1":
     try:
         import hf_transfer  # noqa
     except Exception:
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
-try:
-    from diffusers import AutoencoderKL
-except Exception:
-    AutoencoderKL = None
-
-# Mapper
-try:
-    from mapper import to_skin_layout
-except Exception:
-    # Fallback por si no se copia mapper.py (no debe ocurrir si sigues el Dockerfile)
-    def to_skin_layout(img: Image.Image) -> bytes:
-        if img.width != img.height:
-            s = min(img.width, img.height)
-            img = img.crop((0, 0, s, s))
-        if img.mode != "RGBA":
-            img = img.convert("RGBA")
-        out = img.resize((64, 64), resample=Image.NEAREST)
-        buf = io.BytesIO()
-        out.save(buf, format="PNG")
-        return buf.getvalue()
-
-# --------- ENV ----------
 MODEL_ID       = os.getenv("MODEL_ID", "monadical-labs/minecraft-skin-generator-sdxl")
 MODEL_REVISION = os.getenv("MODEL_REVISION")  # opcional
 VAE_ID         = os.getenv("VAE_ID", "madebyollin/sdxl-vae-fp16-fix")
-HF_TOKEN       = os.getenv("HF_TOKEN")  # opcional (privados)
+HF_TOKEN       = os.getenv("HF_TOKEN")  # opcional
 
 HEIGHT   = int(os.getenv("GEN_HEIGHT", "1024"))
 WIDTH    = int(os.getenv("GEN_WIDTH",  "1024"))

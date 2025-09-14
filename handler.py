@@ -129,5 +129,20 @@ def handler(event):
 
 runpod.serverless.start({"handler": handler})
 
+# --- Mantener el proceso vivo y loguear salidas “raras”
 if __name__ == "__main__":
-    print(handler({"input": {"prompt": "donald trump minecraft skin", "seed": 123}}))
+    import sys, time, traceback
+    try:
+        # Si ejecutas localmente, sirve como smoke test:
+        # print(handler({"input": {"prompt": "test skin", "seed": 0}}))
+        # En serverless, start() debe quedarse corriendo; si por lo que sea sale,
+        # hacemos loop para no matar el contenedor y ver logs.
+        while True:
+            time.sleep(3600)
+    except SystemExit as e:
+        print(f"[FATAL] SystemExit code={e.code}", flush=True)
+        traceback.print_exc()
+        sys.exit(e.code)
+    except Exception:
+        print("[FATAL] Unhandled exception at top level:\n" + traceback.format_exc(), flush=True)
+        raise
